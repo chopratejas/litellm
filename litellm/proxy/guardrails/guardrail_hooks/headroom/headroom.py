@@ -73,9 +73,26 @@ HEADROOM_RETRIEVE_TOOL_NAME: Final = "headroom_retrieve"
 _HASH_PATTERN: Final = re.compile(r"[a-f0-9]{12,24}")
 _HASH_CACHE_TTL_SECONDS: Final = 15 * 60
 # The provider request Headroom's gateway turn reads, and the part it may rewrite.
-# Everything else in request_data is LiteLLM's own or the client's to keep.
-_GATEWAY_REWRITABLE_KEYS: Final = ("messages", "input", "system", "instructions", "tools", "tool_choice")
-_GATEWAY_BODY_KEYS: Final = (*_GATEWAY_REWRITABLE_KEYS, "model", "max_tokens", "max_output_tokens", "stream")
+# Everything else in request_data is LiteLLM's own or the client's to keep. Native
+# Gemini bodies carry contents and systemInstruction, Bedrock Converse ones toolConfig.
+_GATEWAY_ROW_KEYS: Final = ("messages", "input", "contents")
+_GATEWAY_REWRITABLE_KEYS: Final = (
+    *_GATEWAY_ROW_KEYS,
+    "system",
+    "instructions",
+    "systemInstruction",
+    "system_instruction",
+    "tools",
+    "tool_choice",
+)
+_GATEWAY_BODY_KEYS: Final = (
+    *_GATEWAY_REWRITABLE_KEYS,
+    "toolConfig",
+    "model",
+    "max_tokens",
+    "max_output_tokens",
+    "stream",
+)
 # How long a Headroom without the gateway turn is left alone before it's asked again,
 # so a rolling upgrade or one old replica doesn't switch the feature off for good.
 _GATEWAY_UNSUPPORTED_RETRY_SECONDS: Final = 300.0
@@ -437,7 +454,7 @@ def _without_cache_control(part: object) -> object:
 def _conversation_identity(row: Mapping[str, object]) -> object:
     """A row as a conversation key. Clients move cache_control between turns, and
     with it can resend the same text as a part list instead of a string."""
-    content: Final = row.get("content")
+    content: Final = row["content"] if "content" in row else row.get("parts")
     if isinstance(content, str) or is_all_text_parts(content):
         return content_to_text(content)
     return [_without_cache_control(part) for part in content] if _is_object_list(content) else content
@@ -484,10 +501,18 @@ def _client_anthropic_beta(request_data: Mapping[str, object]) -> str | None:
     )
 
 
+def _rows(body: Mapping[str, object]) -> tuple[str, Sequence[object]] | None:
+    """The conversation and the key it sits under, or None for a request without one."""
+    for key in _GATEWAY_ROW_KEYS:
+        if _is_object_list(rows := body.get(key)) and rows:
+            return key, rows
+    return None
+
+
 def _is_gateway_turn_unsupported(response: HttpxResponse, body: object) -> bool:
-    """An older Headroom: it rejects the mode, or answers in the legacy messages-only shape."""
+    """An older Headroom: it rejects the mode or the body's wire shape, or answers in the legacy messages-only shape."""
     if response.status_code == 400:
-        return "config.mode" in response.text
+        return "config.mode" in response.text or "Missing required field: messages" in response.text
     return _is_str_object_dict(body) and "messages" in body and "body" not in body
 
 
@@ -666,7 +691,9 @@ class HeadroomGuardrail(CustomGuardrail):
             "fail_open" if unreachable_fallback == "fail_open" else "fail_closed"
         )
         self.gateway_turn = gateway_turn
-        self._gateway_turn_retry_at = 0.0
+        # When to ask again, per row key: a Headroom can have the gateway turn but not
+        # yet read native Gemini bodies, and that mustn't switch it off for chat.
+        self._gateway_turn_retry_at: dict[str, float] = {}  # mutable-ok: retry windows change as Headroom answers
         self.compression_mode = compression_mode
         self.ccr_retrieval = ccr_retrieval
         self.async_handler = get_async_httpx_client(
@@ -887,19 +914,34 @@ class HeadroomGuardrail(CustomGuardrail):
     ) -> GenericGuardrailAPIInputs | None:
         """Send Headroom the whole provider request and take back what it rewrites.
 
-        Reads and writes request_data, not the translated inputs: on the Anthropic
-        route those are OpenAI-shaped copies, while Headroom's folds and hooks need
-        the wire shape. The inputs handed back carry no texts or tools and the same
-        structured_messages object, so the translation handlers write nothing over
-        the rewritten request.
+        Reads and writes the provider request, not the translated inputs: on the
+        Anthropic route those are OpenAI-shaped copies, while Headroom's folds and hooks
+        need the wire shape. Native Gemini and Bedrock pass-through requests reach here
+        with flat texts only, and their wire shape is all Headroom needs. The inputs
+        handed back are the ones that came in minus any tools, so the translation
+        handlers write nothing over the rewritten request.
 
         None means this request takes the row-subset path: it isn't a caller's live
         request (the auto-router's routing hop passes a throwaway request_data and
-        reads the result's structured_messages), or Headroom is too old.
+        reads the result's structured_messages), or Headroom is too old for its shape.
         """
         tenant: Final = _request_tenant(request_data)
-        rows: Final = request_data["messages"] if "messages" in request_data else request_data.get("input")
-        if tenant is None or "structured_messages" not in inputs or not _is_object_list(rows) or not rows:
+        # Bedrock pass-through nests the provider request under data, which is forwarded as-is.
+        nested: Final = request_data.get("data")
+        provider_body: Final = (
+            nested
+            if request_data.get("custom_llm_provider") == "bedrock" and _is_str_object_dict(nested)
+            else request_data
+        )
+        conversation: Final = _rows(provider_body)
+        if tenant is None or conversation is None:
+            return None
+        row_key, rows = conversation
+        # Other flat-text routes (embeddings input, say) aren't a conversation.
+        native: Final = provider_body is not request_data or row_key == "contents"
+        if "structured_messages" not in inputs and not native:
+            return None
+        if time.monotonic() < self._gateway_turn_retry_at.get(row_key, 0.0):
             return None
 
         model: Final = self.headroom_model or request_data.get("model")
@@ -910,7 +952,7 @@ class HeadroomGuardrail(CustomGuardrail):
         }
         client_beta: Final = _client_anthropic_beta(request_data)
         payload: Final = {
-            **{key: request_data[key] for key in _GATEWAY_BODY_KEYS if key in request_data},
+            **{key: provider_body[key] for key in _GATEWAY_BODY_KEYS if key in provider_body},
             **({"model": model} if model else {}),
             "config": config,
             "gateway": {
@@ -925,11 +967,12 @@ class HeadroomGuardrail(CustomGuardrail):
         end_time: Final = time.time()
         match outcome:
             case _TurnUnsupported(status_code=status_code):
-                self._gateway_turn_retry_at = time.monotonic() + _GATEWAY_UNSUPPORTED_RETRY_SECONDS
+                self._gateway_turn_retry_at[row_key] = time.monotonic() + _GATEWAY_UNSUPPORTED_RETRY_SECONDS
                 verbose_proxy_logger.warning(
-                    "Headroom at %s has no lossless gateway turn (HTTP %s); using row-subset compression and "
+                    "Headroom at %s has no lossless gateway turn for %s bodies (HTTP %s); falling back and "
                     "asking again in %d seconds. Upgrade headroom-ai to get it.",
                     self.headroom_api_base,
+                    row_key,
                     status_code,
                     _GATEWAY_UNSUPPORTED_RETRY_SECONDS,
                 )
@@ -948,12 +991,15 @@ class HeadroomGuardrail(CustomGuardrail):
                 # a tool it deferred, say), so it goes from the request too.
                 dropped: Final = tuple(key for key in _GATEWAY_REWRITABLE_KEYS if key in payload and key not in body)
                 for key in dropped:
-                    _ = request_data.pop(key, None)
-                rewrites: Final = {key: body[key] for key in _GATEWAY_REWRITABLE_KEYS if key in body}
+                    _ = provider_body.pop(key, None)
+                provider_body.update({key: body[key] for key in _GATEWAY_REWRITABLE_KEYS if key in body})
                 extra_headers: Final = _merged_extra_headers(request_data.get("extra_headers"), answer.get("headers"))
-                request_data.update({**rewrites, **({"extra_headers": extra_headers} if extra_headers else {})})
+                request_data.update({"extra_headers": extra_headers} if extra_headers else {})
                 self._record_outcome(request_data, "success", _compression_stats(answer), start_time, end_time)
-        return GenericGuardrailAPIInputs(structured_messages=inputs["structured_messages"])
+        # Handing back the texts unchanged tells a flat-text handler there is nothing to write.
+        if "structured_messages" in inputs:
+            return GenericGuardrailAPIInputs(structured_messages=inputs["structured_messages"])
+        return GenericGuardrailAPIInputs(texts=inputs.get("texts", []))
 
     def _record_outcome(
         self,
@@ -1037,7 +1083,7 @@ class HeadroomGuardrail(CustomGuardrail):
             verbose_proxy_logger.debug("Headroom: background request; skipping compression")
             return inputs
 
-        if self.gateway_turn and time.monotonic() >= self._gateway_turn_retry_at:
+        if self.gateway_turn:
             turned: Final = await self._apply_gateway_turn(inputs, request_data)
             if turned is not None:
                 return turned

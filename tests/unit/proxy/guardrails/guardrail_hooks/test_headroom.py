@@ -34,6 +34,8 @@ from fastapi import HTTPException
 import litellm
 from litellm.litellm_core_utils.litellm_logging import Logging
 from litellm.llms.anthropic.chat.guardrail_translation.handler import AnthropicMessagesHandler
+from litellm.llms.bedrock.passthrough.guardrail_translation.handler import BedrockPassthroughGuardrailHandler
+from litellm.llms.gemini.google_genai.guardrail_translation.handler import GoogleGenAIGenerateContentHandler
 from litellm.llms.openai.chat.guardrail_translation.handler import OpenAIChatCompletionsHandler
 from litellm.llms.openai.responses.guardrail_translation.handler import OpenAIResponsesHandler
 from litellm.proxy.guardrails.guardrail_hooks.headroom.headroom import (
@@ -3306,6 +3308,135 @@ async def test_gateway_turn_on_responses_route_applies_the_answer():
     assert result["instructions"] == "trimmed"
 
 
+def _gemini_request() -> dict:
+    call = {"functionCall": {"name": "Read", "args": {}}, "thoughtSignature": "sig"}
+    return {
+        "model": "gemini-2.5-pro",
+        "systemInstruction": {"parts": [{"text": "system"}]},
+        "contents": [
+            {"role": "user", "parts": [{"text": "task"}]},
+            {"role": "model", "parts": [call]},
+            {"role": "user", "parts": [{"functionResponse": {"name": "Read", "response": {"output": "text"}}}]},
+        ],
+        "tools": [{"functionDeclarations": [{"name": "Read"}]}],
+        "config": {"temperature": 0.2},
+        **_caller(),
+    }
+
+
+@pytest.mark.asyncio
+async def test_gateway_turn_on_native_gemini_route_sends_the_contents_and_applies_the_answer():
+    data = _gemini_request()
+    folded = [
+        *data["contents"][:2],
+        {"role": "user", "parts": [{"functionResponse": {"name": "Read", "response": {"output": "f"}}}]},
+    ]
+    guardrail = _gateway_guardrail()
+
+    with _posting(
+        guardrail, return_value=_gateway_answer({"contents": folded, "systemInstruction": data["systemInstruction"]})
+    ) as post:
+        result = await GoogleGenAIGenerateContentHandler().process_input_messages(
+            data=data, guardrail_to_apply=guardrail
+        )
+
+    payload = post.await_args.kwargs["json"]
+    assert set(payload) == {"model", "systemInstruction", "contents", "tools", "config", "gateway"}
+    assert payload["config"] == {"mode": "lossless"}
+    assert result["contents"] == folded
+    assert result["systemInstruction"] == {"parts": [{"text": "system"}]}
+    assert "tools" not in result  # Headroom left them out of its answer
+    assert result["config"] == {"temperature": 0.2}
+
+
+def _bedrock_request(endpoint: str, body: dict) -> dict:
+    return {
+        "model": "us.anthropic.claude-sonnet-4-5",
+        "method": "POST",
+        "endpoint": endpoint,
+        "data": body,
+        "custom_llm_provider": "bedrock",
+        **_caller(),
+    }
+
+
+@pytest.mark.asyncio
+async def test_gateway_turn_on_bedrock_converse_rewrites_the_forwarded_body():
+    result_block = {"toolResult": {"toolUseId": "t1", "content": [{"text": "text"}]}}
+    body = {
+        "system": [{"text": "system"}, {"cachePoint": {"type": "default"}}],
+        "messages": [
+            {"role": "user", "content": [{"text": "task"}]},
+            {"role": "assistant", "content": [{"toolUse": {"toolUseId": "t1", "name": "Read", "input": {}}}]},
+            {"role": "user", "content": [result_block]},
+        ],
+        "toolConfig": {"tools": [{"toolSpec": {"name": "Read"}}]},
+        "inferenceConfig": {"maxTokens": 512},
+    }
+    folded = [
+        *body["messages"][:2],
+        {"role": "user", "content": [{"toolResult": {"toolUseId": "t1", "content": [{"text": "f"}]}}]},
+    ]
+    data = _bedrock_request("model/us.anthropic.claude-sonnet-4-5/converse", body)
+    guardrail = _gateway_guardrail()
+
+    with _posting(guardrail, return_value=_gateway_answer({"messages": folded, "system": body["system"]})) as post:
+        result = await BedrockPassthroughGuardrailHandler().process_input_messages(
+            data=data, guardrail_to_apply=guardrail
+        )
+
+    payload = post.await_args.kwargs["json"]
+    assert set(payload) == {"model", "system", "messages", "toolConfig", "config", "gateway"}
+    assert result["data"]["messages"] == folded
+    assert result["data"]["inferenceConfig"] == {"maxTokens": 512}
+
+
+@pytest.mark.asyncio
+async def test_gateway_turn_on_bedrock_invoke_rewrites_the_anthropic_body():
+    body = {
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": 512,
+        "messages": [
+            {"role": "user", "content": "task"},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "Read", "input": {}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "text"}]},
+        ],
+    }
+    folded = [
+        *body["messages"][:2],
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "f"}]},
+    ]
+    data = _bedrock_request("model/us.anthropic.claude-sonnet-4-5/invoke", body)
+    guardrail = _gateway_guardrail()
+
+    with _posting(guardrail, return_value=_gateway_answer({"messages": folded})):
+        result = await BedrockPassthroughGuardrailHandler().process_input_messages(
+            data=data, guardrail_to_apply=guardrail
+        )
+
+    assert result["data"]["messages"] == folded
+    assert result["data"]["anthropic_version"] == "bedrock-2023-05-31"
+
+
+@pytest.mark.asyncio
+async def test_headroom_without_native_bodies_leaves_gemini_alone_and_keeps_the_turn_for_chat():
+    """A Headroom with the gateway turn but no Gemini view answers 400; chat keeps the turn."""
+    data = _gemini_request()
+    sent = json.loads(json.dumps(data["contents"]))
+    guardrail = _gateway_guardrail()
+    rejected = _raised_status(400, "Missing required field: messages or input")
+    chat = {"model": "m", "messages": [{"role": "user", "content": "task"}], **_caller()}
+
+    with _posting(guardrail, side_effect=[rejected, _gateway_answer({"messages": chat["messages"]})]) as post:
+        result = await GoogleGenAIGenerateContentHandler().process_input_messages(
+            data=data, guardrail_to_apply=guardrail
+        )
+        await _apply_turn(guardrail, chat)
+
+    assert result["contents"] == sent
+    assert "gateway" in post.await_args.kwargs["json"]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "answer",
@@ -3335,7 +3466,7 @@ async def test_older_headroom_falls_back_and_is_asked_again_later(answer):
         assert "gateway" not in post.await_args.kwargs["json"]
         await _apply_turn(guardrail, turn())
         assert "gateway" not in post.await_args.kwargs["json"]
-        guardrail._gateway_turn_retry_at = 0.0  # the retry window has passed
+        guardrail._gateway_turn_retry_at.clear()  # the retry window has passed
         await _apply_turn(guardrail, turn())
 
     assert "gateway" in post.await_args.kwargs["json"]
@@ -3351,7 +3482,7 @@ async def test_other_400s_fail_closed_and_keep_the_gateway_turn():
             await _apply_turn(guardrail, data)
 
     assert raised.value.status_code == 502
-    assert guardrail._gateway_turn_retry_at == 0.0
+    assert not guardrail._gateway_turn_retry_at
 
 
 @pytest.mark.asyncio
