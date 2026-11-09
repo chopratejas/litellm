@@ -3183,6 +3183,11 @@ def _raised_status(status: int, text: str) -> httpx.HTTPStatusError:
     return httpx.HTTPStatusError(text, request=request, response=httpx.Response(status, text=text, request=request))
 
 
+def _rejected(message: str) -> httpx.HTTPStatusError:
+    """Headroom's 400 for a request it won't take, as its JSON error body."""
+    return _raised_status(400, json.dumps({"error": {"type": "invalid_request", "message": message}}))
+
+
 def _caller(api_key: str = "hashed-key") -> dict:
     return {"metadata": {"user_api_key_auth": UserAPIKeyAuth(api_key=api_key)}}
 
@@ -3333,9 +3338,9 @@ async def test_gateway_turn_on_native_gemini_route_sends_the_contents_and_applie
     ]
     guardrail = _gateway_guardrail()
 
-    with _posting(
-        guardrail, return_value=_gateway_answer({"contents": folded, "systemInstruction": data["systemInstruction"]})
-    ) as post:
+    answer = _gateway_answer({"contents": folded}, wire_shape="gemini")
+
+    with _posting(guardrail, return_value=answer) as post:
         result = await GoogleGenAIGenerateContentHandler().process_input_messages(
             data=data, guardrail_to_apply=guardrail
         )
@@ -3344,14 +3349,15 @@ async def test_gateway_turn_on_native_gemini_route_sends_the_contents_and_applie
     assert set(payload) == {"model", "systemInstruction", "contents", "tools", "config", "gateway"}
     assert payload["config"] == {"mode": "lossless"}
     assert result["contents"] == folded
+    # Left out of the answer, so kept as the client sent them.
     assert result["systemInstruction"] == {"parts": [{"text": "system"}]}
-    assert "tools" not in result  # Headroom left them out of its answer
+    assert result["tools"] == [{"functionDeclarations": [{"name": "Read"}]}]
     assert result["config"] == {"temperature": 0.2}
 
 
 def _bedrock_request(endpoint: str, body: dict) -> dict:
+    """What the direct Bedrock pass-through route hands the guardrail: no top-level model."""
     return {
-        "model": "us.anthropic.claude-sonnet-4-5",
         "method": "POST",
         "endpoint": endpoint,
         "data": body,
@@ -3360,10 +3366,9 @@ def _bedrock_request(endpoint: str, body: dict) -> dict:
     }
 
 
-@pytest.mark.asyncio
-async def test_gateway_turn_on_bedrock_converse_rewrites_the_forwarded_body():
+def _converse_body() -> dict:
     result_block = {"toolResult": {"toolUseId": "t1", "content": [{"text": "text"}]}}
-    body = {
+    return {
         "system": [{"text": "system"}, {"cachePoint": {"type": "default"}}],
         "messages": [
             {"role": "user", "content": [{"text": "task"}]},
@@ -3373,20 +3378,31 @@ async def test_gateway_turn_on_bedrock_converse_rewrites_the_forwarded_body():
         "toolConfig": {"tools": [{"toolSpec": {"name": "Read"}}]},
         "inferenceConfig": {"maxTokens": 512},
     }
+
+
+CONVERSE_ENDPOINT = "model/us.anthropic.claude-sonnet-4-5/converse"
+
+
+@pytest.mark.asyncio
+async def test_gateway_turn_on_bedrock_converse_rewrites_the_forwarded_body():
+    body = _converse_body()
     folded = [
         *body["messages"][:2],
         {"role": "user", "content": [{"toolResult": {"toolUseId": "t1", "content": [{"text": "f"}]}}]},
     ]
-    data = _bedrock_request("model/us.anthropic.claude-sonnet-4-5/converse", body)
+    data = _bedrock_request(CONVERSE_ENDPOINT, body)
     guardrail = _gateway_guardrail()
 
-    with _posting(guardrail, return_value=_gateway_answer({"messages": folded, "system": body["system"]})) as post:
+    answer = _gateway_answer({"messages": folded, "system": body["system"]}, wire_shape="converse")
+
+    with _posting(guardrail, return_value=answer) as post:
         result = await BedrockPassthroughGuardrailHandler().process_input_messages(
             data=data, guardrail_to_apply=guardrail
         )
 
     payload = post.await_args.kwargs["json"]
     assert set(payload) == {"model", "system", "messages", "toolConfig", "config", "gateway"}
+    assert payload["model"] == "us.anthropic.claude-sonnet-4-5"  # read from the endpoint
     assert result["data"]["messages"] == folded
     assert result["data"]["inferenceConfig"] == {"maxTokens": 512}
 
@@ -3395,6 +3411,7 @@ async def test_gateway_turn_on_bedrock_converse_rewrites_the_forwarded_body():
 async def test_gateway_turn_on_bedrock_invoke_rewrites_the_anthropic_body():
     body = {
         "anthropic_version": "bedrock-2023-05-31",
+        "anthropic_beta": ["context-1"],
         "max_tokens": 512,
         "messages": [
             {"role": "user", "content": "task"},
@@ -3409,13 +3426,18 @@ async def test_gateway_turn_on_bedrock_invoke_rewrites_the_anthropic_body():
     data = _bedrock_request("model/us.anthropic.claude-sonnet-4-5/invoke", body)
     guardrail = _gateway_guardrail()
 
-    with _posting(guardrail, return_value=_gateway_answer({"messages": folded})):
+    answer = _gateway_answer({"messages": folded}, headers={"anthropic-beta": "context-1,tools-2"})
+
+    with _posting(guardrail, return_value=answer):
         result = await BedrockPassthroughGuardrailHandler().process_input_messages(
             data=data, guardrail_to_apply=guardrail
         )
 
     assert result["data"]["messages"] == folded
     assert result["data"]["anthropic_version"] == "bedrock-2023-05-31"
+    # Pass-through sends no extra headers, so the beta goes in the body Bedrock reads it from.
+    assert result["data"]["anthropic_beta"] == ["context-1", "tools-2"]
+    assert "extra_headers" not in result
 
 
 @pytest.mark.asyncio
@@ -3424,13 +3446,14 @@ async def test_headroom_without_native_bodies_leaves_gemini_alone_and_keeps_the_
     data = _gemini_request()
     sent = json.loads(json.dumps(data["contents"]))
     guardrail = _gateway_guardrail()
-    rejected = _raised_status(400, "Missing required field: messages or input")
+    rejected = _rejected("Missing required field: messages or input")
     chat = {"model": "m", "messages": [{"role": "user", "content": "task"}], **_caller()}
+    handler = GoogleGenAIGenerateContentHandler()
 
     with _posting(guardrail, side_effect=[rejected, _gateway_answer({"messages": chat["messages"]})]) as post:
-        result = await GoogleGenAIGenerateContentHandler().process_input_messages(
-            data=data, guardrail_to_apply=guardrail
-        )
+        result = await handler.process_input_messages(data=data, guardrail_to_apply=guardrail)
+        await handler.process_input_messages(data=_gemini_request(), guardrail_to_apply=guardrail)
+        assert post.await_count == 1  # the next Gemini request isn't sent again inside the window
         await _apply_turn(guardrail, chat)
 
     assert result["contents"] == sent
@@ -3438,10 +3461,58 @@ async def test_headroom_without_native_bodies_leaves_gemini_alone_and_keeps_the_
 
 
 @pytest.mark.asyncio
+async def test_generic_pass_through_gemini_body_takes_the_gateway_turn():
+    """A /gemini pass-through route with guardrails on forwards the same dict it hands over."""
+    from litellm.llms.pass_through.guardrail_translation.handler import PassThroughEndpointHandler
+
+    data = _gemini_request()
+    folded = [*data["contents"][:2], {"role": "user", "parts": [{"text": "f"}]}]
+    guardrail = _gateway_guardrail()
+
+    with _posting(guardrail, return_value=_gateway_answer({"contents": folded}, wire_shape="gemini")):
+        result = await PassThroughEndpointHandler().process_input_messages(data=data, guardrail_to_apply=guardrail)
+
+    assert result["contents"] == folded
+
+
+@pytest.mark.asyncio
+async def test_headroom_without_converse_views_leaves_the_bedrock_body_alone():
+    """An older Headroom reads Converse messages as chat and answers; its answer is not applied."""
+    body = _converse_body()
+    sent = json.loads(json.dumps(body))
+    data = _bedrock_request(CONVERSE_ENDPOINT, body)
+    guardrail = _gateway_guardrail()
+    misread = _gateway_answer({"messages": body["messages"], "tools": [{"name": "headroom_retrieve"}]})
+
+    with _posting(guardrail, return_value=misread):
+        result = await BedrockPassthroughGuardrailHandler().process_input_messages(
+            data=data, guardrail_to_apply=guardrail
+        )
+
+    assert result["data"] == sent
+    assert set(guardrail._gateway_turn_retry_at) == {"bedrock"}
+
+
+@pytest.mark.asyncio
+async def test_native_gateway_turn_fail_open_writes_nothing():
+    data = _gemini_request()
+    sent = json.loads(json.dumps(data["contents"]))
+    guardrail = _gateway_guardrail(unreachable_fallback="fail_open")
+
+    with _posting(guardrail, side_effect=httpx.ConnectError("down")):
+        result = await GoogleGenAIGenerateContentHandler().process_input_messages(
+            data=data, guardrail_to_apply=guardrail
+        )
+
+    assert result["contents"] == sent
+    assert result["systemInstruction"] == {"parts": [{"text": "system"}]}
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "answer",
     [
-        pytest.param(lambda: _raised_status(400, "Invalid config.mode: 'lossless'"), id="mode_rejected"),
+        pytest.param(lambda: _rejected("Invalid config.mode: 'lossless'. Valid: ccr"), id="mode_rejected"),
         pytest.param(
             lambda: MagicMock(status_code=200, text="{}", **{"json.return_value": {"messages": [{"role": "user"}]}}),
             id="legacy_shape",
@@ -3477,7 +3548,7 @@ async def test_other_400s_fail_closed_and_keep_the_gateway_turn():
     guardrail = _gateway_guardrail()
     data = {"model": "m", "messages": [{"role": "user", "content": "task"}], **_caller()}
 
-    with _posting(guardrail, side_effect=_raised_status(400, "config.session_id must be a string")):
+    with _posting(guardrail, side_effect=_rejected("Invalid config.session_id: 7. Must be a string")):
         with pytest.raises(HTTPException) as raised:
             await _apply_turn(guardrail, data)
 

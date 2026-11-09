@@ -93,6 +93,12 @@ _GATEWAY_BODY_KEYS: Final = (
     "max_output_tokens",
     "stream",
 )
+# Keys Headroom may leave out of its answer on purpose (a tool_choice naming a tool it
+# deferred, say). Any other key missing from the answer stays as the client sent it.
+_GATEWAY_DROPPABLE_KEYS: Final = ("tool_choice", "tools")
+_CONVERSE_ACTIONS: Final = frozenset({"converse", "converse-stream"})
+# What Headroom answers when it can't read the body's wire shape.
+_UNREADABLE_BODY_MESSAGE: Final = "Missing required field: messages or input"
 # How long a Headroom without the gateway turn is left alone before it's asked again,
 # so a rolling upgrade or one old replica doesn't switch the feature off for good.
 _GATEWAY_UNSUPPORTED_RETRY_SECONDS: Final = 300.0
@@ -509,11 +515,51 @@ def _rows(body: Mapping[str, object]) -> tuple[str, Sequence[object]] | None:
     return None
 
 
+def _error_message(response: HttpxResponse) -> str | None:
+    """Headroom's ``error.message``, or None for an answer that doesn't carry one."""
+    try:
+        parsed: Final = _json_body(response)
+    except ValueError:
+        return None
+    error: Final = parsed.get("error") if _is_str_object_dict(parsed) else None
+    message: Final = error.get("message") if _is_str_object_dict(error) else None
+    return message if isinstance(message, str) else None
+
+
 def _is_gateway_turn_unsupported(response: HttpxResponse, body: object) -> bool:
     """An older Headroom: it rejects the mode or the body's wire shape, or answers in the legacy messages-only shape."""
     if response.status_code == 400:
-        return "config.mode" in response.text or "Missing required field: messages" in response.text
+        message: Final = _error_message(response)
+        return message is not None and (
+            message.startswith("Invalid config.mode:") or message == _UNREADABLE_BODY_MESSAGE
+        )
     return _is_str_object_dict(body) and "messages" in body and "body" not in body
+
+
+def _bedrock_endpoint_parts(request_data: Mapping[str, object]) -> Sequence[str] | None:
+    """The path segments of a Bedrock pass-through request, or None for any other request."""
+    endpoint: Final = request_data.get("endpoint")
+    if request_data.get("custom_llm_provider") != "bedrock" or not isinstance(endpoint, str):
+        return None
+    return endpoint.strip("/").split("/")
+
+
+def _native_wire_shape(row_key: str, bedrock_parts: Sequence[str] | None) -> str | None:
+    """The shape only a Headroom with native views reads; it has to echo it back as wire_shape."""
+    if row_key == "contents":
+        return "gemini"
+    if bedrock_parts is not None and bedrock_parts[-1] in _CONVERSE_ACTIONS:
+        return "converse"
+    return None
+
+
+def _merged_beta_list(
+    existing: object, header: object
+) -> list[str]:  # mutable-ok: written into the invoke body as its JSON list
+    """An invoke body's anthropic_beta list plus the comma-separated betas Headroom asks for."""
+    current: Final = [str(beta) for beta in existing] if _is_object_list(existing) else []
+    added: Final = [beta.strip() for beta in str(header).split(",") if beta.strip()]
+    return list(dict.fromkeys((*current, *added)))
 
 
 def _json_or_none(response: HttpxResponse) -> object:
@@ -691,9 +737,7 @@ class HeadroomGuardrail(CustomGuardrail):
             "fail_open" if unreachable_fallback == "fail_open" else "fail_closed"
         )
         self.gateway_turn = gateway_turn
-        # When to ask again, per row key: a Headroom can have the gateway turn but not
-        # yet read native Gemini bodies, and that mustn't switch it off for chat.
-        self._gateway_turn_retry_at: dict[str, float] = {}  # mutable-ok: retry windows change as Headroom answers
+        self._gateway_turn_retry_at: dict[str, float] = {}  # mutable-ok: retry window per body shape
         self.compression_mode = compression_mode
         self.ccr_retrieval = ccr_retrieval
         self.async_handler = get_async_httpx_client(
@@ -927,12 +971,9 @@ class HeadroomGuardrail(CustomGuardrail):
         """
         tenant: Final = _request_tenant(request_data)
         # Bedrock pass-through nests the provider request under data, which is forwarded as-is.
+        bedrock_parts: Final = _bedrock_endpoint_parts(request_data)
         nested: Final = request_data.get("data")
-        provider_body: Final = (
-            nested
-            if request_data.get("custom_llm_provider") == "bedrock" and _is_str_object_dict(nested)
-            else request_data
-        )
+        provider_body: Final = nested if bedrock_parts is not None and _is_str_object_dict(nested) else request_data
         conversation: Final = _rows(provider_body)
         if tenant is None or conversation is None:
             return None
@@ -941,10 +982,14 @@ class HeadroomGuardrail(CustomGuardrail):
         native: Final = provider_body is not request_data or row_key == "contents"
         if "structured_messages" not in inputs and not native:
             return None
-        if time.monotonic() < self._gateway_turn_retry_at.get(row_key, 0.0):
+        shape: Final = (
+            "gemini" if row_key == "contents" else "bedrock" if provider_body is not request_data else row_key
+        )
+        if time.monotonic() < self._gateway_turn_retry_at.get(shape, 0.0):
             return None
 
-        model: Final = self.headroom_model or request_data.get("model")
+        endpoint_model: Final = bedrock_parts[1] if bedrock_parts and bedrock_parts[0] == "model" else None
+        model: Final = self.headroom_model or request_data.get("model") or endpoint_model
         session_id: Final = _gateway_session_id(request_data, rows, model, tenant)
         config: Final = {
             **({"session_id": session_id} if session_id else {}),
@@ -962,17 +1007,25 @@ class HeadroomGuardrail(CustomGuardrail):
             },
         }
         affinity: Final = _session_affinity(request_data) or session_id
+        expected_shape: Final = _native_wire_shape(row_key, bedrock_parts)
         start_time: Final = time.time()
-        outcome: Final = await self._call_gateway_turn(payload, affinity)
+        sent: Final = await self._call_gateway_turn(payload, affinity)
         end_time: Final = time.time()
+        # A Headroom without native views reads a Converse body as chat and answers anyway.
+        misread: Final = (
+            expected_shape is not None
+            and isinstance(sent, _TurnAnswered)
+            and sent.answer.get("wire_shape") != expected_shape
+        )
+        outcome: Final = _TurnUnsupported(200) if misread else sent
         match outcome:
             case _TurnUnsupported(status_code=status_code):
-                self._gateway_turn_retry_at[row_key] = time.monotonic() + _GATEWAY_UNSUPPORTED_RETRY_SECONDS
+                self._gateway_turn_retry_at[shape] = time.monotonic() + _GATEWAY_UNSUPPORTED_RETRY_SECONDS
                 verbose_proxy_logger.warning(
-                    "Headroom at %s has no lossless gateway turn for %s bodies (HTTP %s); falling back and "
+                    "Headroom at %s can't read this body shape (%s, HTTP %s); falling back and "
                     "asking again in %d seconds. Upgrade headroom-ai to get it.",
                     self.headroom_api_base,
-                    row_key,
+                    shape,
                     status_code,
                     _GATEWAY_UNSUPPORTED_RETRY_SECONDS,
                 )
@@ -987,16 +1040,46 @@ class HeadroomGuardrail(CustomGuardrail):
                 )
                 return inputs
             case _TurnAnswered(answer=answer, body=body):
-                # A key Headroom sent back without was dropped on purpose (a tool_choice naming
-                # a tool it deferred, say), so it goes from the request too.
-                dropped: Final = tuple(key for key in _GATEWAY_REWRITABLE_KEYS if key in payload and key not in body)
-                for key in dropped:
-                    _ = provider_body.pop(key, None)
-                provider_body.update({key: body[key] for key in _GATEWAY_REWRITABLE_KEYS if key in body})
-                extra_headers: Final = _merged_extra_headers(request_data.get("extra_headers"), answer.get("headers"))
+                headers: Final = answer.get("headers")
+                wanted: Final = dict(headers) if _is_str_object_dict(headers) else {}
+                # Pass-through forwards no extra headers; only an invoke body can carry a beta.
+                if provider_body is not request_data and (
+                    set(wanted) - {"anthropic-beta"} or ("anthropic-beta" in wanted and expected_shape is not None)
+                ):
+                    self._record_outcome(
+                        request_data,
+                        "guardrail_failed_to_respond",
+                        {"error": "headroom needs headers this route can't send; request forwarded uncompressed"},
+                        start_time,
+                        end_time,
+                    )
+                    return inputs
+                droppable: Final = ("tool_choice",) if native else _GATEWAY_DROPPABLE_KEYS
+                for key in droppable:
+                    if key in payload and key not in body:
+                        _ = provider_body.pop(key, None)
+                provider_body.update(
+                    {
+                        key: body[key]
+                        for key in _GATEWAY_REWRITABLE_KEYS
+                        if key in body and (key in payload or not native)
+                    }
+                )
+                if provider_body is not request_data and "anthropic-beta" in wanted:
+                    provider_body.update(
+                        {
+                            "anthropic_beta": _merged_beta_list(
+                                provider_body.get("anthropic_beta"), wanted["anthropic-beta"]
+                            )
+                        }
+                    )
+                extra_headers: Final = (
+                    _merged_extra_headers(request_data.get("extra_headers"), wanted)
+                    if provider_body is request_data
+                    else None
+                )
                 request_data.update({"extra_headers": extra_headers} if extra_headers else {})
                 self._record_outcome(request_data, "success", _compression_stats(answer), start_time, end_time)
-        # Handing back the texts unchanged tells a flat-text handler there is nothing to write.
         if "structured_messages" in inputs:
             return GenericGuardrailAPIInputs(structured_messages=inputs["structured_messages"])
         return GenericGuardrailAPIInputs(texts=inputs.get("texts", []))
